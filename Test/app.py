@@ -30,7 +30,7 @@ async def quiz_handler(request: Request):
     Must:
     - Check JSON validity (400 on invalid)
     - Check secret (403 on mismatch)
-    - For valid secret, ALWAYS respond with HTTP 200.
+    - Run quiz solving loop (200 on success)
     """
     # 1. Parse JSON body
     try:
@@ -60,21 +60,12 @@ async def quiz_handler(request: Request):
     # 3. Run quiz loop with 3-minute deadline
     deadline = time.time() + 3 * 60
 
-    try:
-        result = await run_quiz_loop(
-            email=email,
-            secret=secret,
-            start_url=url,
-            deadline=deadline,
-        )
-    except Exception as e:
-        # Never return 500 for valid secret: embed error in JSON instead
-        import traceback
-        traceback.print_exc()
-        result = {
-            "message": "Quiz loop failed with an internal error.",
-            "error": f"{type(e).__name__}: {e}",
-        }
+    result = await run_quiz_loop(
+        email=email,
+        secret=secret,
+        start_url=url,
+        deadline=deadline,
+    )
 
     return JSONResponse(content=result, status_code=200)
 
@@ -151,38 +142,21 @@ async def run_quiz_loop(
 
 
 # ---------------------------------------------------------
-# Fetch quiz page with Playwright + fallback
+# Fetch quiz page with Playwright
 # ---------------------------------------------------------
 
 async def fetch_quiz_page(url: str) -> str:
     """
     Load the quiz URL in a headless browser (Chromium) so that
-    any JavaScript runs, then return the final HTML.
-
-    If Playwright fails (browser not installed, SSL, etc),
-    fall back to simple requests.get so that the quiz loop
-    does not crash.
+    any JavaScript (e.g. atob) runs, then return the final HTML.
     """
-    # First try Playwright
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle")
-            html = await page.content()
-            await browser.close()
-            return html
-    except Exception as e:
-        import traceback
-        print("Playwright fetch_quiz_page error:", repr(e))
-        traceback.print_exc()
-
-    # Fallback: plain HTTP GET
-    try:
-        resp = requests.get(url, timeout=30)
-        return resp.text
-    except Exception as e2:
-        return f"<html><body>FETCH_ERROR: {type(e2).__name__}: {e2}</body></html>"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(url, wait_until="networkidle")
+        html = await page.content()
+        await browser.close()
+        return html
 
 
 # ---------------------------------------------------------
@@ -265,12 +239,11 @@ def compute_sum_value_column_from_pdf(download_url: str) -> float:
     in the table on page 2 (index 1).
     This assumes a well-formed table with a column named 'value'.
     """
-    try:
-        resp = requests.get(download_url, timeout=30)
-    except Exception as e:
-        raise RuntimeError(f"Error downloading PDF: {e}") from e
+    resp = requests.get(download_url)
+    resp.raise_for_status()
 
     from io import BytesIO
+
     pdf_bytes = BytesIO(resp.content)
     total = 0.0
 
@@ -314,7 +287,6 @@ async def submit_answer(
 ) -> Dict[str, Any]:
     """
     Submit the answer payload to the quiz submit_url.
-    Never raises for HTTP status; returns status and body.
     """
     payload: Dict[str, Any] = {
         "email": email,
@@ -325,24 +297,12 @@ async def submit_answer(
     if extra:
         payload.update(extra)
 
+    resp = requests.post(submit_url, json=payload, timeout=30)
+    resp.raise_for_status()
     try:
-        resp = requests.post(submit_url, json=payload, timeout=30)
-    except Exception as e:
-        return {
-            "correct": False,
-            "error": f"Error submitting answer: {e}",
-            "submit_url": submit_url,
-        }
-
-    # Try to decode JSON; if fails, return raw text
-    try:
-        body = resp.json()
+        return resp.json()
     except Exception:
-        body = {"raw_text": resp.text}
-
-    # Attach status code for debugging
-    body.setdefault("http_status", resp.status_code)
-    return body
+        return {"raw_text": resp.text}
 
 
 # ---------------------------------------------------------
